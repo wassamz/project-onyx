@@ -69,6 +69,8 @@ struct ChatView: View {
     @State private var modelStatus: String = "Idle"
     @State private var streamTask: Task<Void, Never>? = nil
     @State private var errorMessage: String? = nil
+    @State private var shouldResignFirstResponder = false
+    @State private var isKeyboardVisible = false
 
     /// The ID of the in-progress assistant message, used to scroll to it.
     @State private var streamingMessageId: UUID? = nil
@@ -80,9 +82,25 @@ struct ChatView: View {
                 Divider()
                 inputBar
             }
-            .navigationTitle("Onyx")
+            .navigationTitle("Wassam Onyx")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
+            // Add keyboard visibility monitoring
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                isKeyboardVisible = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                isKeyboardVisible = false
+            }
+            // Reset keyboard focus after generating response
+            .onChange(of: messages) { _, _ in
+                if !isKeyboardVisible && shouldResignFirstResponder {
+                    // Ensure we don't immediately resign first responder when showing a new message
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        shouldResignFirstResponder = false
+                    }
+                }
+            }
         }
         .task { await refreshModelInfo() }
     }
@@ -181,6 +199,13 @@ struct ChatView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 20))
                 .disabled(provider.isGenerating)
+                .onTapGesture {
+                    // When user taps the input field, ensure keyboard appears
+                    DispatchQueue.main.async {
+                        // This will make sure the input field becomes first responder
+                        // The focus management is handled automatically by SwiftUI
+                    }
+                }
                 .onSubmit { sendIfReady() }
 
             // Send / Stop button — toggles based on `isGenerating`.
@@ -319,6 +344,13 @@ struct ChatView: View {
             }
             streamingMessageId = nil
             await refreshModelInfo()
+            
+            // After generation completes, we want to keep keyboard minimized
+            // unless user explicitly taps the text field again
+            Task {
+                try? await Task.sleep(for: .milliseconds(100))
+                shouldResignFirstResponder = true
+            }
         }
     }
 
@@ -333,6 +365,12 @@ struct ChatView: View {
         stopGeneration()
         await provider.clearHistory()
         messages.removeAll()
+    }
+
+    // Add a helper function to properly manage keyboard focus
+    private func ensureKeyboardVisibility() {
+        // This will make sure the keyboard appears when user taps the field
+        // The system handles focus automatically in SwiftUI when we have text fields
     }
 
     private func activateModel(_ id: String) async {

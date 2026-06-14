@@ -26,7 +26,7 @@ import SwiftUI
 ///
 /// `id` is stable — use it as the `ForEach` id so SwiftUI can animate
 /// individual rows without re-rendering the whole list.
-struct ChatMessage: Identifiable {
+struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     var role: Role
     var text: String

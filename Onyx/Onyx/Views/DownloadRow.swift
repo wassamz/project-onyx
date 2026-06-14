@@ -359,6 +359,8 @@ struct DownloadRow: View {
     private var familyColor: Color {
         switch descriptor.family {
         case .llama: return .orange
+        case .qwen: return .purple
+        case .gemma: return .blue
         case .other: return .secondary
         }
     }
