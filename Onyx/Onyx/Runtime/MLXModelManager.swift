@@ -59,7 +59,11 @@ private struct TokenizerBridge: @unchecked Sendable, MLXLMCommon.Tokenizer {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        try upstream.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+        do {
+            return try upstream.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+        } catch Tokenizers.TokenizerError.missingChatTemplate {
+            throw MLXLMCommon.TokenizerError.missingChatTemplate
+        }
     }
 }
 
@@ -229,6 +233,125 @@ public actor MLXModelManager {
 
 // MARK: - Token streaming
 
+nonisolated func promptTokenIds(
+    for messages: [[String: String]],
+    tokenizer: any MLXLMCommon.Tokenizer,
+    modelId: String?
+) -> [Int] {
+    do {
+        return try tokenizer.applyChatTemplate(messages: messages)
+    } catch MLXLMCommon.TokenizerError.missingChatTemplate {
+        let prompt = fallbackChatPrompt(for: messages, modelId: modelId)
+        return tokenizer.encode(text: prompt, addSpecialTokens: false)
+    } catch {
+        let prompt = fallbackChatPrompt(for: messages, modelId: modelId)
+        return tokenizer.encode(text: prompt, addSpecialTokens: false)
+    }
+}
+
+nonisolated public func fallbackChatPrompt(for messages: [[String: String]], modelId: String?) -> String {
+    let family = modelId.flatMap { ChatModelCatalog.descriptor(forId: $0)?.family }
+
+    switch family {
+    case .qwen:
+        return qwenFallbackPrompt(for: messages)
+    case .gemma:
+        return gemmaFallbackPrompt(for: messages)
+    default:
+        return simpleFallbackPrompt(for: messages)
+    }
+}
+nonisolated private func qwenFallbackPrompt(for messages: [[String: String]]) -> String {
+    var prompt = ""
+    
+    // Qwen natively supports a baseline system persona to steady its reasoning
+    prompt += "<|im_start|>system\nYou are a helpful, fluid, and natural conversational assistant.<|im_end|>\n"
+    
+    for message in messages {
+        let role = message["role"] == "assistant" ? "assistant" : "user"
+        let content = message["content"] ?? ""
+        prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+    }
+    
+    // Force pre-fill generation cue for the assistant's streaming return
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+}
+nonisolated private func gemmaFallbackPrompt(for messages: [[String: String]]) -> String {
+    var prompt = ""
+    for message in messages {
+        let role = message["role"] == "assistant" ? "model" : "user"
+        let content = message["content"] ?? ""
+        prompt += "<start_of_turn>\(role)\n\(content)<end_of_turn>\n"
+    }
+    prompt += "<start_of_turn>model\n"
+    return prompt
+}
+
+nonisolated private func simpleFallbackPrompt(for messages: [[String: String]]) -> String {
+    var prompt = ""
+    for message in messages {
+        let role = message["role"] == "assistant" ? "Assistant" : "User"
+        let content = message["content"] ?? ""
+        prompt += "\(role):\n\(content)\n\n"
+    }
+    prompt += "Assistant:\n"
+    return prompt
+}
+
+nonisolated func shouldBufferGeneratedText(modelId: String?) -> Bool {
+    modelId.flatMap { ChatModelCatalog.descriptor(forId: $0)?.family } == .gemma
+}
+
+nonisolated func visibleGeneratedText(from rawText: String, modelId: String?) -> (text: String, shouldStop: Bool) {
+    guard shouldBufferGeneratedText(modelId: modelId) else { return (rawText, false) }
+
+    var text = rawText
+    while let stripped = text.strippingLeadingGemmaRoleLine() {
+        text = stripped
+    }
+
+    let stopMarkers = [
+        "<end_of_turn>",
+        "<start_of_turn>",
+        "\nmodel\n",
+        "\nmodel ",
+        "\nuser\n",
+        "\nuser ",
+        "model\n",
+        "user\n"
+    ]
+
+    var firstStopRange: Range<String.Index>?
+    for marker in stopMarkers {
+        guard let range = text.range(of: marker) else { continue }
+        if firstStopRange == nil || range.lowerBound < firstStopRange!.lowerBound {
+            firstStopRange = range
+        }
+    }
+
+    guard let firstStopRange else { return (text, false) }
+    return (String(text[..<firstStopRange.lowerBound]), true)
+}
+
+private extension String {
+    func strippingLeadingGemmaRoleLine() -> String? {
+        let trimmedPrefix = drop(while: { $0 == "\n" || $0 == " " || $0 == "\t" })
+        let rolePrefixes = [
+            "<start_of_turn>model\n",
+            "<start_of_turn>model ",
+            "model\n",
+            "model "
+        ]
+
+        for prefix in rolePrefixes where trimmedPrefix.hasPrefix(prefix) {
+            return String(trimmedPrefix.dropFirst(prefix.count))
+        }
+
+        return nil
+    }
+}
+
 /// Stream tokens from a loaded model for a given conversation history.
 ///
 /// This is the core inference function. It applies the model's native chat
@@ -264,14 +387,16 @@ public actor MLXModelManager {
 nonisolated public func generateFromModel(
     container: ModelContainer,
     messages: [[String: String]],
-    maxTokens: Int = 1024,
-    temperature: Float = 0.6,
-    topP: Float = 0.9
+    modelId: String? = nil,
+    maxKVSize: Int = 2048, //added
+    maxTokens: Int = 384, //Int = 1024,
+    temperature: Float = 0.7, //Float = 0.6,
+    topP: Float = 0.85 //Float = 0.9
 ) async throws -> AsyncStream<String> {
     let tokenizer = await container.tokenizer
-    let tokenIds = try tokenizer.applyChatTemplate(messages: messages)
+    let tokenIds = promptTokenIds(for: messages, tokenizer: tokenizer, modelId: modelId)
     let lmInput = LMInput(tokens: MLXArray(tokenIds))
-    let params = GenerateParameters(temperature: temperature, topP: topP)
+    let params = GenerateParameters(maxTokens: maxTokens, maxKVSize: maxKVSize, temperature: temperature, topP: topP)
 
     let generationStream = try await container.generate(
         input: lmInput,
@@ -280,26 +405,36 @@ nonisolated public func generateFromModel(
 
     return AsyncStream<String> { continuation in
         Task {
-            do {
-                var tokenCount = 0
-                // The labelled break is required: a plain `break` inside a
-                // `switch` only exits the switch, not the enclosing for-await.
-                tokenLoop: for try await event in generationStream {
-                    switch event {
-                    case .chunk(let text):
-                        continuation.yield(text)
-                        tokenCount += 1
-                        if tokenCount >= maxTokens { break tokenLoop }
-                    case .info:
-                        break
-                    default:
-                        break
+            let buffersUntilStop = shouldBufferGeneratedText(modelId: modelId)
+            var rawText = ""
+            var emittedText = ""
+
+            // The labelled break is required: a plain `break` inside a
+            // `switch` only exits the switch, not the enclosing for-await.
+            tokenLoop: for await event in generationStream {
+                switch event {
+                case .chunk(let text):
+                    rawText += text
+                    let visible = visibleGeneratedText(from: rawText, modelId: modelId)
+
+                    if !buffersUntilStop && visible.text.count > emittedText.count {
+                        let delta = visible.text.dropFirst(emittedText.count)
+                        continuation.yield(String(delta))
+                        emittedText = visible.text
                     }
+                    if visible.shouldStop { break tokenLoop }
+                case .info:
+                    break
+                default:
+                    break
                 }
-            } catch {
-                // Errors during generation (e.g. framework-level OOM) are
-                // swallowed here so the stream always terminates cleanly.
-                // The caller sees an abrupt end-of-stream rather than a hang.
+            }
+
+            if buffersUntilStop {
+                let visible = visibleGeneratedText(from: rawText, modelId: modelId)
+                if !visible.text.isEmpty {
+                    continuation.yield(visible.text)
+                }
             }
             continuation.finish()
         }

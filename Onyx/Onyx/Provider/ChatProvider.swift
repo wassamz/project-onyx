@@ -306,6 +306,7 @@ public final class ChatProvider {
             tokenStream = try await generateFromModel(
                 container: container,
                 messages: messages,
+                modelId: await manager.currentModelId,
                 maxTokens: 2048
             )
         } catch {
