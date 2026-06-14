@@ -10,29 +10,94 @@ import XCTest
 
 final class OnyxTests: XCTestCase {
 
-    override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
+    func testHardwareProfileUsesPreciseRAMForModelGate() throws {
+        let profile = HardwareProfile(
+            tier: .base,
+            detectedPCores: 2,
+            detectedRAMMegabytes: 7_800,
+            detectedRAMGigabytes: 7,
+            detectedGPUMemoryMB: 0,
+            isEnvOverridden: false,
+            chipBrand: "Test Chip"
+        )
+
+        let modelSizeBytes = Int64(5_752 * 1_048_576)
+
+        XCTAssertTrue(profile.canLoadModel(approxSizeBytes: modelSizeBytes))
     }
 
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
+    func testHardwareProfileRejectsWhenPreciseRAMIsInsufficient() throws {
+        let profile = HardwareProfile(
+            tier: .base,
+            detectedPCores: 2,
+            detectedRAMMegabytes: 7_168,
+            detectedRAMGigabytes: 7,
+            detectedGPUMemoryMB: 0,
+            isEnvOverridden: false,
+            chipBrand: "Test Chip"
+        )
+
+        let modelSizeBytes = Int64(5_752 * 1_048_576)
+
+        XCTAssertFalse(profile.canLoadModel(approxSizeBytes: modelSizeBytes))
     }
 
-    func testExample() throws {
-        // This is an example of a functional test case.
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-        // Any test you write for XCTest can be annotated as throws and async.
-        // Mark your test throws to produce an unexpected failure when your test encounters an uncaught error.
-        // Mark your test async to allow awaiting for asynchronous code to complete. Check the results with assertions afterwards.
-        // XCTest Documentation
-        // https://developer.apple.com/documentation/xctest
+    func testGemmaFallbackPromptUsesGemmaTurnMarkers() throws {
+        let prompt = fallbackChatPrompt(
+            for: [
+                ["role": "user", "content": "Hello"],
+                ["role": "assistant", "content": "Hi"],
+                ["role": "user", "content": "What can you do?"]
+            ],
+            modelId: "mlx-community/gemma-4-e4b-it-4bit"
+        )
+
+        XCTAssertEqual(
+            prompt,
+            "<start_of_turn>user\nHello<end_of_turn>\n" +
+            "<start_of_turn>model\nHi<end_of_turn>\n" +
+            "<start_of_turn>user\nWhat can you do?<end_of_turn>\n" +
+            "<start_of_turn>model\n"
+        )
     }
 
-    func testPerformanceExample() throws {
-        // This is an example of a performance test case.
-        self.measure {
-            // Put the code you want to measure the time of here.
-        }
+    func testGemmaVisibleTextStopsBeforeRepeatedModelTurn() throws {
+        let visible = visibleGeneratedText(
+            from: "Hi! How can I assist you today?\nmodel \nmodel\nHi! How can I assist you today?",
+            modelId: "mlx-community/gemma-4-e4b-it-4bit"
+        )
+
+        XCTAssertEqual(visible.text, "Hi! How can I assist you today?")
+        XCTAssertTrue(visible.shouldStop)
     }
 
+    func testGemmaVisibleTextStripsLeadingModelRoleEcho() throws {
+        let visible = visibleGeneratedText(
+            from: "model\nHi! How can I assist you today?",
+            modelId: "mlx-community/gemma-4-e4b-it-4bit"
+        )
+
+        XCTAssertEqual(visible.text, "Hi! How can I assist you today?")
+        XCTAssertFalse(visible.shouldStop)
+    }
+
+    func testGemmaVisibleTextStopsBeforeSerializedConversationEcho() throws {
+        let visible = visibleGeneratedText(
+            from: "Hello<end_of_turn>\n<start_of_turn>user\nWhat is the capital of Canada<end_of_turn>",
+            modelId: "mlx-community/gemma-4-e4b-it-4bit"
+        )
+
+        XCTAssertEqual(visible.text, "Hello")
+        XCTAssertTrue(visible.shouldStop)
+    }
+
+    func testGemmaVisibleTextStripsEchoedStartOfTurnModelPrefix() throws {
+        let visible = visibleGeneratedText(
+            from: "<start_of_turn>model\nHello<end_of_turn>",
+            modelId: "mlx-community/gemma-4-e4b-it-4bit"
+        )
+
+        XCTAssertEqual(visible.text, "Hello")
+        XCTAssertTrue(visible.shouldStop)
+    }
 }
