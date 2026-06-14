@@ -53,6 +53,8 @@ public struct HardwareProfile: Sendable {
 
     public let tier: HardwareTier
     public let detectedPCores: Int
+    /// Physical RAM in MiB, used for memory gating without losing fractional GiB.
+    public let detectedRAMMegabytes: Int
     public let detectedRAMGigabytes: Int
     public let detectedGPUMemoryMB: Int
     /// `true` when the tier was forced via the `CHATM_HARDWARE_TIER`
@@ -70,6 +72,7 @@ public struct HardwareProfile: Sendable {
 
     public static func detect() -> HardwareProfile {
         let ramBytes = readSysctlUInt64("hw.memsize") ?? 0
+        let ramMB = Int(ramBytes / 1_048_576)
         let ramGB = Int(ramBytes / 1_073_741_824)
         let pCores = Int(readSysctlInt32("hw.perflevel0.physicalcpu") ?? 0)
             .nonZeroOr(ProcessInfo.processInfo.processorCount)
@@ -88,7 +91,8 @@ public struct HardwareProfile: Sendable {
         }
 
         return HardwareProfile(tier: tier, detectedPCores: pCores,
-                                detectedRAMGigabytes: ramGB, detectedGPUMemoryMB: gpuMB,
+                                detectedRAMMegabytes: ramMB, detectedRAMGigabytes: ramGB,
+                                detectedGPUMemoryMB: gpuMB,
                                 isEnvOverridden: isEnvOverridden, chipBrand: chipBrand)
     }
 
@@ -133,8 +137,7 @@ public struct HardwareProfile: Sendable {
         if isEnvOverridden && tier != .base { return true }
         let weightsMB = Int(approxSizeBytes / 1_048_576)
         let requiredMB = weightsMB + headroomMB
-        let physicalMB = detectedRAMGigabytes * 1_024
-        return physicalMB >= requiredMB
+        return detectedRAMMegabytes >= requiredMB
     }
 
     // MARK: - Diagnostics
